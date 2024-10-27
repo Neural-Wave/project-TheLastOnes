@@ -1,0 +1,146 @@
+from datasets import load_from_disk
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from datasets import DatasetDict
+from transformers import DataCollatorForTokenClassification, Trainer, TrainingArguments
+import evaluate
+import numpy as np
+import torch
+
+class NoisyDataCollatorForTokenClassification(DataCollatorForTokenClassification):
+    def __init__(self, tokenizer, padding="longest", max_length=512, mask_prob=0.1, **kwargs):
+        super().__init__(tokenizer=tokenizer, padding=padding, max_length=max_length, **kwargs)
+        self.mask_prob = mask_prob
+    
+    def add_input_noise(self, input_ids):
+        noisy_ids = []
+        noisy_ids.append(input_ids[0])
+        for input in input_ids[1:-1]:
+            if torch.rand(1).item() < self.mask_prob:
+                noisy_ids.append(self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token))
+            else:
+                noisy_ids.append(input)
+        noisy_ids.append(input_ids[-1])
+        return noisy_ids
+
+
+    def __call__(self, features):
+        for feature in features:
+            if "input_ids" in feature:
+                feature["input_ids"] = self.add_input_noise(feature["input_ids"])
+        return super().__call__(features)
+
+
+label_list = [
+    'B-ACCOUNTNUM',
+    'B-BUILDINGNUM',
+    'B-CITY',
+    'B-CREDITCARDNUMBER',
+    'B-DATEOFBIRTH',
+    'B-DRIVERLICENSENUM',
+    'B-EMAIL',
+    'B-GIVENNAME',
+    'B-IDCARDNUM',
+    'B-PASSWORD',
+    'B-SOCIALNUM',
+    'B-STREET',
+    'B-SURNAME',
+    'B-TAXNUM',
+    'B-TELEPHONENUM',
+    'B-USERNAME',
+    'B-ZIPCODE',
+    'I-ACCOUNTNUM',
+    'I-BUILDINGNUM',
+    'I-CITY',
+    'I-CREDITCARDNUMBER',
+    'I-DATEOFBIRTH',
+    'I-DRIVERLICENSENUM',
+    'I-EMAIL',
+    'I-GIVENNAME',
+    'I-IDCARDNUM',
+    'I-PASSWORD',
+    'I-SOCIALNUM',
+    'I-STREET',
+    'I-SURNAME',
+    'I-TAXNUM',
+    'I-TELEPHONENUM',
+    'I-USERNAME',
+    'I-ZIPCODE',
+    'O',
+]
+
+id2label = {idx: label for idx, label in enumerate(label_list)}
+label2id = {label: idx for idx, label in enumerate(label_list)}
+
+tokenizer = AutoTokenizer.from_pretrained("microsoft/mdeberta-v3-base", truncation=True, max_length=512)
+model = AutoModelForTokenClassification.from_pretrained(
+    "microsoft/mdeberta-v3-base", num_labels=35, id2label=id2label, label2id=label2id)
+
+seqeval = evaluate.load("seqeval")
+
+def compute_metrics(p):
+    predictions, labels = p
+    predictions = np.argmax(predictions, axis=2)
+
+    true_predictions = [
+        [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+    true_labels = [
+        [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+        for prediction, label in zip(predictions, labels)
+    ]
+
+    results = seqeval.compute(predictions=true_predictions, references=true_labels)
+    return {
+        "precision": results["overall_precision"],
+        "recall": results["overall_recall"],
+        "f1": results["overall_f1"],
+        "accuracy": results["overall_accuracy"],
+    }
+
+privacy_dataset = load_from_disk("./tokenized_dataset/gen_tokenized_data")
+remove_columns = [
+    'locale',
+    'split',
+    'privacy_mask',
+    'uid',
+    'mbert_tokens',
+    'mbert_token_classes',
+    'source_text',
+    'masked_text'
+]
+training_set = privacy_dataset["train"].remove_columns(remove_columns)
+validation_set = privacy_dataset["validation"].remove_columns(remove_columns)
+
+training_args = TrainingArguments(
+    output_dir="./results-noise-5",
+    learning_rate=5e-5,
+    per_device_train_batch_size=58,
+    per_device_eval_batch_size=58,
+    num_train_epochs=5,
+    weight_decay=0.01,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    bf16=True,
+    seed=42
+)
+
+data_collator_noisy = NoisyDataCollatorForTokenClassification(
+    tokenizer=tokenizer,
+    mask_prob=0.1,
+    padding="longest", 
+    max_length=512,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=training_set,
+    eval_dataset=validation_set,
+    data_collator=data_collator_noisy,
+    processing_class=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()

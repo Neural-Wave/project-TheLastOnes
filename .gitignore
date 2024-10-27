@@ -1,0 +1,11 @@
+data*
+dataset
+*/*.jsonl
+.idea
+.vscode/
+.bash_history
+.lightning_studio/
+submission/result_v2
+submission/results
+submission/tokenized_dataset
+dataset
